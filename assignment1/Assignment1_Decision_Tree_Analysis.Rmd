@@ -4,767 +4,341 @@ author: "Student Name"
 date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output:
   html_document:
-    toc: true
-    toc_depth: 3
-    toc_float: true
-    number_sections: true
     theme: flatly
     df_print: kable
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(
-  echo = TRUE,
-  message = FALSE,
-  warning = FALSE,
-  fig.align = "center"
-)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
 ```
 
-# Assignment Overview
-
-This report builds and evaluates decision-tree classifiers that predict whether a breast mass is **benign or malignant** from cytology measurements of a fine needle aspirate (FNA). The goal is not just a high accuracy number. The report checks and cleans the data, sets up a fair evaluation, explains how the trees decide, tests how model complexity affects generalization, and ends with a recommendation about whether the model could be used in practice.
-
-**Summary of findings**
-
-* The file has 569 cases and 9 ordinal cytology predictors scored 1–10. The `bare_nuclei` column holds a placeholder value of **−100,000 in 15 rows**. That value is a missing-data code, not a real measurement. Those rows were removed before modeling.
-* The default `rpart` tree is small (3 splits, 4 leaves). Its rules use **uniformity of cell shape, bare nuclei and single epithelial cell size**, and on the held-out test set it catches 40 of 41 malignant cases.
-* A fully grown tree fits the training data perfectly but performs *worse* on the test set. It misses 5 malignant cases, which is clear overfitting. A tree limited to depth 2 performs almost as well as the default tree with one fewer split.
-* **Recommendation:** use the default (`cp = 0.01`) tree. Cross-validation on the training data picks almost the same tree (one extra split on a 6-case leaf, with identical test predictions). Its 99% test accuracy comes from a favorable split. Across 50 random splits, the same procedure averages about 94% accuracy and 93% sensitivity, which is the more realistic expectation. External validation would be needed before any clinical use.
-
-# Load Packages
-
-Only `rpart` and `rpart.plot` are used for modeling. All evaluation metrics are computed directly from the confusion matrix, so it is always clear which class is positive.
-
-```{r packages}
+```{r load}
 library(rpart)
 library(rpart.plot)
-```
-
-# Load Data
-
-```{r load-data}
 df <- read.csv("breast_cancer_dataset.csv")
 ```
 
-# Part 1 - Understand and Prepare the Data
+# Part 1: Data Understanding and Preparation
 
-## 1.1 Initial Inspection
+## Inspection
 
-```{r inspect-data}
+```{r inspect}
 dim(df)
-head(df)
 str(df)
 summary(df)
 ```
 
-### Response
+The file has `r nrow(df)` rows, and each row is a fine needle aspirate from one breast mass. The response is `class`. I am using the coding from the UCI Breast Cancer Wisconsin (Original) documentation: **2 = benign, 4 = malignant**. The other nine columns are the predictors: clump thickness, uniformity of cell size, uniformity of cell shape, marginal adhesion, single epithelial cell size, bare nuclei, bland chromatin, normal nucleoli and mitosis. A cytologist scores each of them from 1 to 10, with higher scores meaning more abnormal cells, so they are ordinal rather than truly continuous. A tree split like "< 2.5" therefore just means "scored 1 or 2". The data agree with this coding: the high scores belong to class 4.
 
-The dataset has **`r nrow(df)` observations and `r ncol(df)` columns**. Each row is one FNA sample from a breast mass.
+## Class distribution
 
-* **Response variable:** `class`, a coded label. Using the class definitions of the Wisconsin Breast Cancer (original) data that this file comes from, **2 = benign** and **4 = malignant**.
-* **Predictors (9):** `clump_thickness`, `uniformity_of_cell_size`, `uniformity_of_cell_shape`, `marginal_adhesion`, `single_epithelial_cell_size`, `bare_nuclei`, `bland_chromatin`, `normal_nucleoli` and `mitosis`. Each is a cytologist's **ordinal score from 1 to 10**, where higher values mean more abnormal-looking cells. They are stored as integers. They are not continuous measurements, so a split such as "< 2.5" just means "a score of 1 or 2".
-
-The `summary()` output already shows a problem: the minimum of `bare_nuclei` is **−100,000**, which cannot occur on a 1–10 scale.
-
-## 1.2 Examine the Target Variable
-
-```{r class-distribution}
-class_counts <- table(df$class)
-class_counts
-round(prop.table(class_counts), 3)
-
-barplot(class_counts, names.arg = c("2 (benign)", "4 (malignant)"),
-        col = c("#4c9f70", "#c0504d"), ylab = "Number of cases",
-        main = "Class distribution (raw data)")
-```
-
-### Response
-
-The classes are **moderately imbalanced**. `r class_counts["2"]` cases (`r round(100*prop.table(class_counts)["2"],1)`%) are benign and `r class_counts["4"]` (`r round(100*prop.table(class_counts)["4"],1)`%) are malignant. Benign is the majority class.
-
-This matters for evaluation in three ways:
-
-1. A model that **always predicts "benign"** is already about 63% accurate while detecting no cancers at all. Accuracy has to be judged against that floor, not against 0%.
-2. Accuracy pools both error types. Because benign cases outnumber malignant ones, a model can look accurate while still missing a large share of the smaller, more important malignant class. Sensitivity and precision for the malignant class are therefore needed.
-3. With only about 40 malignant cases in a 20% test set, every missed cancer moves sensitivity by about 2.5 percentage points. Small differences between models may be noise.
-
-## 1.3 Data-Quality Investigation
-
-The predictors should all be integers between 1 and 10. The code checks this for every column and also looks for missing values and duplicate rows.
-
-```{r data-quality}
-predictors <- setdiff(names(df), "class")
-
-quality <- data.frame(
-  variable      = predictors,
-  min           = sapply(df[predictors], min),
-  max           = sapply(df[predictors], max),
-  n_NA          = sapply(df[predictors], function(x) sum(is.na(x))),
-  n_outside_1_10 = sapply(df[predictors], function(x) sum(!(x %in% 1:10))),
-  row.names = NULL
-)
-quality
-
-# Which values are invalid, and in which class do they occur?
-bad_rows <- which(df$bare_nuclei < 1 | df$bare_nuclei > 10)
-table(invalid_value = df$bare_nuclei[bad_rows])
-table(class_of_invalid_rows = df$class[bad_rows])
-
-# Valid distribution of bare_nuclei for reference
-table(df$bare_nuclei[-bad_rows])
-
-# Exact duplicate rows
-sum(duplicated(df))
-```
-
-A short check shows what happens if the placeholder is left in the data. A tree splits on thresholds, so −100,000 is simply treated as "very low bare nuclei", which is the benign-looking end of the scale:
-
-```{r sentinel-demo}
-# For illustration only: how does a tree trained on uncleaned data treat these rows?
-demo_tree <- rpart(factor(class) ~ ., data = df, method = "class")
-data.frame(row          = bad_rows,
-           true_class   = df$class[bad_rows],
-           predicted    = predict(demo_tree, df[bad_rows, ], type = "class"))
-```
-
-### Response
-
-**Issue found: invalid `bare_nuclei` values.** Eight predictors are clean: integers 1–10 with no missing values. `bare_nuclei` contains **`r length(bad_rows)` rows equal to −100,000**. This value is far outside the 1–10 scale and occurs nowhere else, so it is clearly a **placeholder for a missing value**. (The original UCI version of this dataset has 16 missing `bare_nuclei` values coded "?".) Of these rows, `r sum(df$class[bad_rows] == 2)` are benign and `r sum(df$class[bad_rows] == 4)` are malignant.
-
-**Why it is a problem.** R reads the column as numeric, so nothing flags it. The code would run, but the model would be learning from fictitious values:
-
-* Any summary of `bare_nuclei` is badly distorted. Its mean is dragged down to about −2,600.
-* A tree treats −100,000 as an extremely *low* score, which on this scale means benign-looking. In this particular tree the two malignant placeholder rows are still classified correctly. That is only because the tree reaches them through other variables: both have high cell-shape/size scores. Any split on `bare_nuclei` sends all 15 rows to the "low bare nuclei" (benign-leaning) side, whatever their true value. The model gets them right by luck, not because it reads −100,000 correctly, and a different tree or sample could misclassify them.
-* `bare_nuclei` is one of the most predictive variables, so this error sits in exactly the column the model relies on most.
-
-**How it was handled.** The placeholder was recoded to `NA`, and those **`r length(bad_rows)` rows (`r round(100*length(bad_rows)/nrow(df),1)`% of the data) were removed**. Reasons for this choice:
-
-* The loss is small, and it barely changes the class balance (see 1.4).
-* Removing the rows avoids inventing values. Imputing the median (1) would label all 15 cases as having normal nuclei, which may be wrong for the malignant ones.
-* `rpart` could keep the rows using surrogate splits. However, the evaluation in Part 5 needs clean, fully observed test cases, and using the same complete-case data for every model keeps the comparison simple.
-
-The trade-off is that a deployed model would still receive cases with missing `bare_nuclei` and would need a rule for them. This is noted as a limitation.
-
-**Duplicates.** There are `r sum(duplicated(df))` rows that exactly repeat another row. They were **kept**. With 9 discrete 1–10 scores, many truly different patients share identical profiles, especially the common "all ones" benign profile. There is no patient ID to prove a row is a repeated record. No duplicated profile has conflicting labels. The duplicates do affect how optimistic the test results are (see 2.3).
-
-**Assumptions made before modeling, and which could affect the conclusions:**
-
-| Assumption | Could it affect conclusions? |
-|---|---|
-| `class` coding is 2 = benign, 4 = malignant (standard WBC definition). | **Yes, critically.** If the coding were reversed, every interpretation and the choice of positive class would flip. |
-| −100,000 means "missing" and has no other meaning; the 15 rows are missing roughly at random. | **Yes, somewhat.** The excluded rows are 87% benign versus 63% overall. If missingness is linked to the diagnosis, complete-case results may not represent future cases with missing data. |
-| Each row is an independent patient. | **Yes.** If duplicates are repeated records of the same patient, identical rows can appear in both training and test sets, and test performance will be overstated. |
-| The 1–10 scores were assigned consistently, for example by the same lab or protocol. | **Yes, for generalization.** Trees use hard cut-offs such as "shape score ≥ 3". A lab that scores differently would shift cases across those cut-offs. |
-| Labels are correct, and the sample represents the population where the model would be used. | **Yes.** The data come from a single historical source, so performance elsewhere is unknown. |
-
-## 1.4 Prepare the Data
-
-```{r prepare-data}
-# 1. Recode the placeholder as missing, then keep complete cases
-df$bare_nuclei[df$bare_nuclei == -100000] <- NA
-df <- df[complete.cases(df), ]
-rownames(df) <- NULL
-
-# 2. Convert the response to a labelled factor (2 = benign, 4 = malignant)
-df$class <- factor(df$class, levels = c(2, 4), labels = c("benign", "malignant"))
-
-# Verify the resulting structure
-str(df)
+```{r classes}
 table(df$class)
 round(prop.table(table(df$class)), 3)
 ```
 
-The cleaned data contain **`r nrow(df)` cases**: `r sum(df$class=="benign")` benign (`r round(100*mean(df$class=="benign"),1)`%) and `r sum(df$class=="malignant")` malignant (`r round(100*mean(df$class=="malignant"),1)`%). This is essentially the same balance as before cleaning. All predictors are now valid 1–10 scores. The response uses readable labels, so confusion matrices are easy to read.
+The data is about 63% benign and 37% malignant, so benign is the majority class. This is not severe imbalance, but it matters. A model can reach roughly 63% accuracy without ever detecting a cancer, which means accuracy has to be compared against that floor. Malignant-class metrics such as sensitivity and precision also need to be reported alongside accuracy. And with only about 40 malignant cases in a 20% test set, one missed cancer moves sensitivity by about 2.5 points.
 
-# Part 2 - Establish an Evaluation Strategy
+## Data quality
 
-## 2.1 Define the Positive Class
+```{r quality}
+predictors <- setdiff(names(df), "class")
+data.frame(min = sapply(df[predictors], min),
+           max = sapply(df[predictors], max),
+           n_missing = sapply(df[predictors], function(x) sum(is.na(x))),
+           n_outside_1_to_10 = sapply(df[predictors], function(x) sum(!x %in% 1:10)))
 
-```{r positive-class}
-positive_class <- "malignant"   # original code 4
-negative_class <- "benign"      # original code 2
+bad <- df$bare_nuclei == -100000
+table(class_of_bad_rows = df$class[bad])
+sum(duplicated(df))
 ```
 
-### Response
+Eight of the predictors are clean. `bare_nuclei` contains `r sum(bad)` rows with the value **-100000**, which cannot occur on a 1 to 10 scale and is clearly a code for a missing value. R reads it as an ordinary number, so nothing flags it. A tree would treat it as an extremely low bare-nuclei score, which is the benign-looking end of the scale. That would quietly bias the variable the model relies on most, and it pushes the mean of the column to about -2,600.
 
-**Malignant (code 4) is the positive class.** The model would serve as a screening or triage aid, so the event that matters is cancer. Defining malignant as positive gives the metrics a direct clinical meaning:
+I recoded these values to `NA` and dropped the `r sum(bad)` rows, which is `r round(100*mean(bad),1)`% of the data. I chose not to impute: setting them to the median (1) would make every one of these cases look like it has normal nuclei, and two of them are malignant. Dropping so few rows barely changes the class balance. The cost is that the final model has no tested rule for a case with missing bare nuclei.
 
-* **Sensitivity (recall):** the share of actual cancers the model catches.
-* **Specificity:** the share of benign masses correctly cleared.
-* **Precision:** when the model says "malignant", how often it is right.
+There are also `r sum(duplicated(df))` exact duplicate rows. I kept them. With nine discrete scores, different patients can easily share the same profile (the all-ones benign profile is very common), there is no patient ID to show that a row is a repeat, and no duplicated profile has conflicting labels.
 
-"Positive" here means "the condition being tested for is present". It is the same convention used in diagnostic testing, not a statement about which label has the larger numeric code.
+**Assumptions:**
 
-## 2.2 Majority-Class Baseline
+- The class coding is 2 = benign, 4 = malignant. This is the assumption the results depend on most. If it were reversed, every interpretation would flip.
+- -100000 means "missing" and those rows are missing at random. They are 13 benign and 2 malignant, so they lean benign compared with the full data. If missingness were related to the diagnosis, the results would not fully carry over to incomplete cases.
+- Each row is a separate patient. If the duplicates are actually repeated records, identical rows can land in both the training and test sets and inflate test performance (checked below).
+- Scores were assigned consistently. The tree uses hard cut-offs, so a lab that scores differently would push cases across them.
 
-```{r majority-baseline}
-majority_class <- names(which.max(table(df$class)))
-majority_class
-baseline_accuracy <- max(prop.table(table(df$class)))
-round(baseline_accuracy, 3)
+## Preparation
+
+```{r prepare}
+df$bare_nuclei[df$bare_nuclei == -100000] <- NA
+df <- na.omit(df)
+df$class <- factor(df$class, levels = c(2, 4), labels = c("benign", "malignant"))
+str(df)
+table(df$class)
 ```
 
-### Response
+# Part 2: Evaluation Strategy
 
-The majority class is **benign**. A classifier that always predicts "benign" would be about **`r round(100*baseline_accuracy,1)`% accurate**. Its sensitivity would be **0%** because it never detects a cancer, its specificity would be 100%, and its precision would be undefined.
+## Positive class
 
-This baseline is useful because it sets the **minimum a model must beat to be worth anything**. A tree with 75% accuracy might sound acceptable, but it would be only slightly better than doing nothing. The baseline also shows why accuracy alone is misleading. A useless model gets more than 60% accuracy here because it is right about the majority class.
+```{r positive}
+positive_class <- "malignant"
+```
 
-## 2.3 Training and Test Split
+I treat **malignant (code 4)** as the positive class, because cancer is the condition the model is meant to detect. With this choice, sensitivity is the share of cancers the model catches, specificity is the share of benign masses it correctly clears, and precision is how often a "malignant" prediction is correct. That is the natural way to read a diagnostic test.
 
-A **stratified** 80/20 split is used. Within each class, 80% of the rows are sampled at random for training, so both sets keep the same benign/malignant mix.
+## Majority-class baseline
 
-```{r split-data}
+```{r majority}
+baseline_acc <- max(prop.table(table(df$class)))
+round(baseline_acc, 3)
+```
+
+Always predicting "benign" gives `r round(100*baseline_acc,1)`% accuracy, with 0% sensitivity and 100% specificity. A tree has to clearly beat this to be useful. The baseline also shows why accuracy can mislead: a classifier that catches no cancers at all still gets over 60%.
+
+## Train/test split
+
+```{r split}
 set.seed(1)
-
-# Stratified sampling: draw 80% of the rows from each class separately
 train_idx <- unlist(lapply(split(seq_len(nrow(df)), df$class),
-                           function(rows) sample(rows, round(0.8 * length(rows)))))
-
+                           function(i) sample(i, round(0.8 * length(i)))))
 train_data <- df[train_idx, ]
 test_data  <- df[-train_idx, ]
 
-# Sizes and class distributions
-data.frame(set = c("Full", "Train", "Test"),
-           n   = c(nrow(df), nrow(train_data), nrow(test_data)),
-           benign    = c(sum(df$class == "benign"), sum(train_data$class == "benign"), sum(test_data$class == "benign")),
-           malignant = c(sum(df$class == "malignant"), sum(train_data$class == "malignant"), sum(test_data$class == "malignant")),
-           pct_malignant = round(100 * c(mean(df$class == "malignant"),
-                                         mean(train_data$class == "malignant"),
-                                         mean(test_data$class == "malignant")), 1))
+rbind(train = table(train_data$class), test = table(test_data$class))
 
-# How many test rows have an identical predictor profile somewhere in the training set?
-profile <- function(d) do.call(paste, c(d[predictors], sep = "-"))
-n_overlap <- sum(profile(test_data) %in% profile(train_data))
+# test rows whose exact predictor profile also appears in training
+key <- function(d) do.call(paste, d[predictors])
+n_overlap <- sum(key(test_data) %in% key(train_data))
 n_overlap
 ```
 
-### Response
+I used a stratified split: 80% of the benign rows and 80% of the malignant rows were sampled separately, with a fixed seed so the split is reproducible. This gives `r nrow(train_data)` training rows and `r nrow(test_data)` test rows, and both sets are about 37% malignant. I stratified because a purely random split of only about 200 malignant cases could leave the training set short of cancers or give the test set a different class mix. Accuracy and precision depend on the class mix, so the scores would then partly reflect luck in the split rather than the model.
 
-**How the split was made.** `set.seed(1)` makes the split reproducible. Rows were sampled separately within each class: 80% of benign rows and 80% of malignant rows go to training. This gives `r nrow(train_data)` training and `r nrow(test_data)` test observations, both with about `r round(100*mean(test_data$class=="malignant"))`% malignant cases.
+The test set has to stay untouched because its only job is to estimate performance on new patients. If it is used to fit the model or to pick settings, the model is partly tuned to those `r nrow(test_data)` cases and the reported score is biased upward. All tuning here uses the training data only.
 
-**Why preserve the class distribution.** With only about 200 malignant cases, a simple random split could by chance put noticeably more or fewer cancers in the test set. That causes two problems:
+One caveat: `r n_overlap` of the `r nrow(test_data)` test rows (`r round(100*n_overlap/nrow(test_data))`%) have a predictor profile that also appears in training, mostly very common benign profiles. Test scores are likely somewhat optimistic for that reason.
 
-* If the **training** set is short of malignant cases, the tree sees fewer examples of cancer and learns weaker rules for it.
-* If the **test** set's mix differs from the population, the metrics are distorted. Accuracy and precision depend directly on the class mix, so the results would partly reflect the luck of the split. With about 41 malignant test cases, a few cases more or less noticeably changes sensitivity.
+# Part 3: Baseline Decision Tree
 
-Stratifying removes this source of variation, so differences between models reflect the models rather than the split.
-
-**Why the test set must not be used to train or tune.** The test set exists to estimate performance on **new, unseen patients**. If it is used to fit the model, or to choose among settings such as "which `cp` gives the best test accuracy", the selected model is partly fitted to those specific 111 cases. The reported score is then optimistically biased, an effect known as data leakage. With a test set this small, the chance of "finding" a setting that looks good only on these cases is high. In this report, all tuning uses the training data, either through `rpart`'s internal cross-validation or through settings chosen in advance. Each model is evaluated on the test set once.
-
-**A caveat about this split.** `r n_overlap` of the `r nrow(test_data)` test rows (`r round(100*n_overlap/nrow(test_data))`%) have a predictor profile identical to at least one training row. These are mostly very common benign profiles, such as all scores equal to 1. The model has effectively "seen" these cases already, so **test performance is likely somewhat optimistic**.
-
-# Part 3 - Build and Interpret a Baseline Decision Tree
-
-## 3.1 Fit the Baseline Model
-
-The baseline uses the `rpart` defaults: Gini splitting, `minsplit = 20`, `minbucket = 7`, `cp = 0.01` and `maxdepth = 30`.
-
-```{r baseline-tree}
-model_baseline <- rpart(
-  class ~ .,
-  data = train_data,
-  method = "class"
-)
-
+```{r baseline}
+model_baseline <- rpart(class ~ ., data = train_data, method = "class")
 model_baseline
 ```
 
-## 3.2 Visualize the Tree
-
-Each node shows the predicted class, the **probability of malignancy** in that node, and the percentage of training cases that reach it.
-
-```{r plot-baseline-tree, fig.width=10, fig.height=6}
-rpart.plot(model_baseline, type = 2, extra = 106, under = TRUE,
-           box.palette = "GnRd", shadow.col = "gray",
-           main = "Baseline decision tree (rpart defaults)")
-```
-
-```{r baseline-importance}
-# Variable importance (includes credit for surrogate splits)
+```{r plot-baseline, fig.width=9, fig.height=5.5}
+rpart.plot(model_baseline, type = 2, extra = 106, under = TRUE, box.palette = "GnRd",
+           main = "Baseline tree (rpart defaults)")
 round(model_baseline$variable.importance, 1)
 ```
 
-## 3.3 Interpret the Tree
-
-```{r baseline-node-stats, include=FALSE}
+```{r node-stats, include=FALSE}
 fr <- model_baseline$frame
-node_n   <- setNames(fr$n, rownames(fr))
-node_pm  <- setNames(round(100 * fr$yval2[, 5], 1), rownames(fr))   # P(malignant)
+nn <- setNames(fr$n, rownames(fr))
+pm <- setNames(round(100 * fr$yval2[, 5]), rownames(fr))
 ```
 
-### Response
+**Root split.** The tree first splits on `uniformity_of_cell_shape` at 2.5, which separates scores of 1 or 2 from scores of 3 and above. Cases with uniform cell shape (`r nn["2"]` of `r nn["1"]` training rows) are only `r pm["2"]`% malignant and are predicted benign immediately. Cases with irregular shape are `r pm["3"]`% malignant. This one split removes about 75% of the training error. In other words, whether the cells look alike is by far the strongest single signal. That fits the biology: benign tissue has regular cells, while cancer cells vary in shape.
 
-**What variable is used for the root split?**
+**Second split.** Within the irregular-shape branch, the tree asks about `bare_nuclei`. A score of 3 or more leads to the largest malignant leaf, with `r nn["7"]` cases that are `r pm["7"]`% malignant. A low bare-nuclei score leaves a small mixed group of `r nn["6"]` cases (about `r pm["6"]`% malignant), which the tree resolves with `single_epithelial_cell_size`. Small cells (1 to 3) are predicted benign, and larger cells (4 or more) are predicted malignant.
 
-The root split is on **`uniformity_of_cell_shape` at 2.5**, which in practice means a score of 1–2 versus 3 or higher.
+**In plain terms,** the tree calls a mass malignant when the cells are irregular in shape **and** there are either many bare nuclei or enlarged epithelial cells. Otherwise it calls the mass benign. Every split sends the higher, more abnormal score toward malignant, which makes sense clinically. The importance scores show that `uniformity_of_cell_size` is almost as informative as cell shape even though it is not in the tree. The two are highly correlated (r = `r round(cor(train_data$uniformity_of_cell_shape, train_data$uniformity_of_cell_size), 2)`), so they largely carry the same information. Mitosis contributes almost nothing.
 
-**Interpret the root split in plain language. What does it imply about how the model separates the classes?**
+## Training performance
 
-The first question the tree asks is: *are the cells roughly the same shape?*
-
-* **Yes (shape score 1–2):** `r node_n["2"]` of `r node_n["1"]` training cases (`r round(100*node_n["2"]/node_n["1"])`%) go to this branch, and only `r node_pm["2"]`% of them are malignant. The tree stops here and predicts **benign**.
-* **No (shape score ≥ 3):** the remaining `r node_n["3"]` cases are `r node_pm["3"]`% malignant, so this branch leans strongly **malignant**.
-
-This single question separates the classes very well. In the CP table, the root split alone removes about 75% of the training error. Normal breast epithelium tends to have cells of consistent size and shape. Cancer cells grow in a disordered way and vary in shape, a property called pleomorphism. The tree has found that cell-shape irregularity is the strongest single sign of malignancy.
-
-**Interpret at least one additional important split or branch.**
-
-Among cases with irregular shape, the tree asks a second question about **`bare_nuclei` (≥ 2.5, i.e. a score of 3+)**:
-
-* **Shape irregular AND bare nuclei ≥ 3:** this is the largest malignant leaf. It holds `r node_n["7"]` cases (`r round(100*node_n["7"]/node_n["1"])`% of training) and is `r node_pm["7"]`% malignant. This is the tree's main "cancer profile". Bare nuclei are nuclei without surrounding cytoplasm, which are common in malignant aspirates.
-* **Shape irregular but bare nuclei 1–2:** this is the uncertain group. It holds only `r node_n["6"]` cases and is about `r node_pm["6"]`% malignant. The tree resolves it with **`single_epithelial_cell_size`**. Cell size 1–3 is predicted **benign** (`r node_pm["12"]`% malignant in training). Size ≥ 4 is predicted **malignant** (`r node_pm["13"]`% malignant).
-
-In plain language, the tree predicts *benign* when cells are uniform in shape, or when they are irregular but have few bare nuclei and small epithelial cells. It predicts *malignant* when cells are irregular in shape **and** show either many bare nuclei or enlarged epithelial cells. The whole model is three yes/no questions.
-
-**Do the variables and split structure near the top of the tree make sense based on the problem and the data? Explain.**
-
-Yes. The top variables are cell-shape uniformity, bare nuclei and epithelial cell size, and each is a recognised cytological sign of malignancy. In every split, the **higher (more abnormal) score leads toward "malignant"**, which is the expected direction for these scales. The tree never splits in a medically odd direction.
-
-The variable-importance scores also show that **`uniformity_of_cell_size` is nearly as important as cell shape** even though it never appears in the tree. The two are highly correlated (r ≈ `r round(cor(train_data$uniformity_of_cell_shape, train_data$uniformity_of_cell_size), 2)`), so they carry nearly the same information. Which one becomes the root is close to arbitrary. This point is revisited in the stability analysis (Bonus 3). By contrast, `mitosis` and `clump_thickness` contribute almost nothing once the top variables are known.
-
-## 3.4 Training Performance
-
-A helper function builds the confusion matrix with **malignant as the positive class** and computes every metric from it.
-
-```{r metric-helper}
-evaluate <- function(model, data, positive = positive_class) {
+```{r evaluate-fn}
+evaluate <- function(model, data) {
   pred <- predict(model, data, type = "class")
-  cm   <- table(Predicted = factor(pred, levels = c(negative_class, positive)),
-                Actual    = factor(data$class, levels = c(negative_class, positive)))
-  TP <- cm[positive, positive];       TN <- cm[negative_class, negative_class]
-  FP <- cm[positive, negative_class]; FN <- cm[negative_class, positive]
-  precision   <- TP / (TP + FP)
-  sensitivity <- TP / (TP + FN)
+  cm <- table(Actual = data$class, Predicted = pred)
+  TP <- cm["malignant", "malignant"]; FN <- cm["malignant", "benign"]
+  FP <- cm["benign", "malignant"];    TN <- cm["benign", "benign"]
+  sens <- TP / (TP + FN); prec <- TP / (TP + FP)
   list(cm = cm,
-       metrics = c(Accuracy    = (TP + TN) / sum(cm),
-                   Sensitivity = sensitivity,
-                   Specificity = TN / (TN + FP),
-                   Precision   = precision,
-                   F1          = 2 * precision * sensitivity / (precision + sensitivity),
-                   FN = FN, FP = FP))
+       metrics = c(Accuracy = (TP + TN) / sum(cm), Sensitivity = sens,
+                   Specificity = TN / (TN + FP), Precision = prec,
+                   F1 = 2 * prec * sens / (prec + sens), FN = FN, FP = FP))
 }
-```
-
-```{r baseline-training-performance}
 train_base <- evaluate(model_baseline, train_data)
 train_base$cm
 round(train_base$metrics, 3)
 ```
 
-### Response
+On the training data the tree is `r round(100*train_base$metrics["Accuracy"],1)`% accurate, with `r round(100*train_base$metrics["Sensitivity"],1)`% sensitivity and `r round(100*train_base$metrics["Specificity"],1)`% specificity. I see no strong sign of overfitting. The tree has only 4 leaves, the smallest leaf still holds `r min(fr$n[fr$var=="<leaf>"])` cases, and the tree still makes `r train_base$metrics["FN"] + train_base$metrics["FP"]` training errors, whereas an overfit tree would push training error toward zero. The weak spot is the `r train_base$metrics["FN"]` missed cancers. All of them sit in the "uniform shape, predict benign" leaf, so they are cancers that look bland on the strongest variable.
 
-On the training data the baseline tree reaches **`r round(100*train_base$metrics["Accuracy"],1)`% accuracy**, far above the `r round(100*baseline_accuracy,1)`% majority-class baseline. Sensitivity is `r round(100*train_base$metrics["Sensitivity"],1)`%, specificity is `r round(100*train_base$metrics["Specificity"],1)`% and F1 is `r round(train_base$metrics["F1"],3)`.
+# Part 4: Model Complexity
 
-The training results show **little sign of overfitting**:
+I fit two additional trees that move complexity in opposite directions from the default:
 
-* The tree has only 4 leaves, and every leaf contains at least `r min(model_baseline$frame$n[model_baseline$frame$var=="<leaf>"])` training cases. It is not memorising individual patients.
-* It still makes `r sum(train_base$metrics[c("FN","FP")])` training errors (`r train_base$metrics["FN"]` missed cancers and `r train_base$metrics["FP"]` false alarms). An overfit tree would drive training error toward zero.
-* `rpart`'s 10-fold cross-validated error for this tree (xerror ≈ `r round(model_baseline$cptable[nrow(model_baseline$cptable),"xerror"],2)` of the root error) is higher than its resubstitution error (`r round(model_baseline$cptable[nrow(model_baseline$cptable),"rel error"],2)`). The gap is modest, which is normal.
+```{r complexity}
+model_full <- rpart(class ~ ., data = train_data, method = "class",
+                    control = rpart.control(cp = 0, minsplit = 2, minbucket = 1))
 
-The main warning sign is the **`r train_base$metrics["FN"]` missed cancers**. Most sit in the large "shape score 1–2 → benign" leaf, which still contains a few malignant cases. Training performance alone cannot show whether this tree generalizes. That requires the held-out test data (Part 5).
-
-# Part 4 - Investigate Model Complexity
-
-Two additional trees deliberately move complexity in **opposite directions** from the default:
-
-1. **Fully grown tree (`model_full`).** Complexity control is effectively switched off with `cp = 0`, `minsplit = 2` and `minbucket = 1`, so the tree keeps splitting until every leaf is pure. This shows what overfitting looks like on this data.
-2. **Controlled tree (`model_controlled`).** Complexity is restricted with `maxdepth = 2` and `minbucket = 10`.
-
-## 4.1 Fit a Controlled or Pruned Tree
-
-```{r controlled-tree}
-# (a) Deliberately over-complex tree: grow until leaves are pure
-model_full <- rpart(
-  class ~ .,
-  data = train_data,
-  method = "class",
-  control = rpart.control(cp = 0, minsplit = 2, minbucket = 1, xval = 10)
-)
-
-# (b) Deliberately constrained tree
-model_controlled <- rpart(
-  class ~ .,
-  data = train_data,
-  method = "class",
-  control = rpart.control(maxdepth = 2, minbucket = 10)
-)
-
-tree_size <- function(m) c(splits = sum(m$frame$var != "<leaf>"),
-                           leaves = sum(m$frame$var == "<leaf>"),
-                           depth  = max(rpart:::tree.depth(as.numeric(rownames(m$frame)))))
-rbind(Full = tree_size(model_full),
-      Baseline = tree_size(model_baseline),
-      Controlled = tree_size(model_controlled))
-
+model_controlled <- rpart(class ~ ., data = train_data, method = "class",
+                          control = rpart.control(maxdepth = 2, minbucket = 10))
 model_controlled
 ```
 
-## 4.2 Document Your Modeling Decision
+```{r sizes, echo=FALSE}
+tree_size <- function(m) c(splits = sum(m$frame$var != "<leaf>"),
+                           leaves = sum(m$frame$var == "<leaf>"),
+                           depth = max(rpart:::tree.depth(as.numeric(rownames(m$frame)))))
+rbind(Full = tree_size(model_full), Baseline = tree_size(model_baseline),
+      Controlled = tree_size(model_controlled))
+```
 
-### Response
+**Why these settings.** `maxdepth = 2` limits every prediction to two questions. The baseline spends its third level on a split that covers only `r nn["6"]` training cases (about `r round(100*nn["6"]/nn["1"])`%), and I wanted to see whether that rule is worth keeping or is just fitting a small, noisy group. `minbucket = 10` makes sure each leaf's probability is based on at least 10 patients. The fully grown tree (`cp = 0`, `minsplit = 2`, `minbucket = 1`) is not a candidate for use. It shows what happens when complexity is not controlled at all. I chose all of these settings before looking at the test results.
 
-**What was changed, and why.**
-
-* **`maxdepth = 2`** limits the tree to *at most two questions* per prediction. The baseline tree spends its third level on a split that serves only `r node_n["6"]` training cases (about `r round(100*node_n["6"]/node_n["1"])`%). A two-level tree tests whether that extra rule is worth keeping, or whether it is fitting a small, noisy subgroup. Depth is also the most interpretable control: a two-question rule is something a clinician could check by hand.
-* **`minbucket = 10`** requires every leaf to contain at least 10 training cases. Each leaf's predicted probability of malignancy is then based on a reasonable number of patients, not 1 or 2.
-* **The fully grown tree** (`cp = 0`, `minsplit = 2`, `minbucket = 1`) is the opposite case. It is not a candidate for use. It is included to show **how training and test performance diverge** when complexity is not controlled. Its cross-validation table is reused in Bonus 2.
-
-These settings were chosen **before** looking at test performance. They come from the structure of the baseline tree and general reasoning about complexity, not from the test results.
-
-## 4.3 Visualize the Controlled Tree
-
-```{r plot-controlled-tree, fig.width=9, fig.height=5}
-rpart.plot(model_controlled, type = 2, extra = 106, under = TRUE,
-           box.palette = "GnRd", shadow.col = "gray",
+```{r plot-controlled, fig.width=8, fig.height=4.5}
+rpart.plot(model_controlled, type = 2, extra = 106, under = TRUE, box.palette = "GnRd",
            main = "Controlled tree (maxdepth = 2, minbucket = 10)")
 ```
 
-For contrast, the fully grown tree:
-
-```{r plot-full-tree, fig.width=12, fig.height=8}
-rpart.plot(model_full, type = 2, extra = 106, under = FALSE, cex = 0.6,
-           box.palette = "GnRd", tweak = 1.1,
-           main = "Fully grown tree (cp = 0, minsplit = 2, minbucket = 1)")
+```{r plot-full, fig.width=12, fig.height=7.5}
+rpart.plot(model_full, type = 2, extra = 106, cex = 0.6, box.palette = "GnRd",
+           main = "Fully grown tree")
 ```
 
-### Response
+**How the structure changed.** The controlled tree keeps the same two top splits as the baseline (cell shape, then bare nuclei) and drops only the epithelial cell size split. The mixed group of `r nn["6"]` cases becomes a single benign leaf. The fully grown tree goes to `r tree_size(model_full)["leaves"]` leaves and depth `r tree_size(model_full)["depth"]`, and many of its leaves hold only 1 to 3 patients. Those lower splits isolate individual unusual cases rather than general patterns. All three trees share the same root, so the main signal is stable. They differ only in how far they chase the small, ambiguous groups.
 
-**How controlling complexity changed the tree.**
+# Part 5: Model Evaluation (Test Set)
 
-* The **controlled tree** keeps exactly the **same top two splits** as the baseline: cell shape ≥ 3, then bare nuclei ≥ 3. It drops only the third-level split on `single_epithelial_cell_size`. The result is `r tree_size(model_controlled)["leaves"]` leaves instead of `r tree_size(model_baseline)["leaves"]`. The "irregular shape but few bare nuclei" group (`r node_n["6"]` cases, about `r node_pm["6"]`% malignant) now becomes one leaf predicted **benign**. Because that group is mixed, the tree accepts a few more missed cancers there in return for a simpler rule.
-* The **fully grown tree** keeps splitting into many small leaves: `r tree_size(model_full)["splits"]` splits, `r tree_size(model_full)["leaves"]` leaves and depth `r tree_size(model_full)["depth"]`. It uses `r length(unique(model_full$frame$var[model_full$frame$var != "<leaf>"]))` different predictors, and many of its leaves hold only 1–3 training cases. Those lower splits separate individual unusual patients, such as malignant cases with low scores or benign cases with high ones. They are unlikely to reflect patterns that hold for new patients.
+Malignant is the positive class in all of the results below.
 
-All three trees agree on the root split. The core signal, cell-shape irregularity, is robust. The trees differ only in how far they go into the small, ambiguous subgroups.
+## Baseline tree
 
-# Part 5 - Evaluate and Compare the Models
-
-All three trees are evaluated **once** on the `r nrow(test_data)` held-out test cases (`r sum(test_data$class=="malignant")` malignant, `r sum(test_data$class=="benign")` benign). Malignant is the positive class throughout.
-
-## 5.1 Baseline Tree - Test Performance
-
-```{r baseline-test-performance}
+```{r test-baseline}
 test_base <- evaluate(model_baseline, test_data)
 test_base$cm
 round(test_base$metrics, 3)
 ```
 
-## 5.2 Controlled Tree - Test Performance
+## Controlled tree
 
-```{r controlled-test-performance}
+```{r test-controlled}
 test_ctrl <- evaluate(model_controlled, test_data)
 test_ctrl$cm
 round(test_ctrl$metrics, 3)
+```
 
-# Fully grown tree, for the complexity comparison
+## Fully grown tree
+
+```{r test-full}
 test_full <- evaluate(model_full, test_data)
 test_full$cm
 round(test_full$metrics, 3)
 ```
 
-## 5.3 Model Comparison Table
+## Comparison
 
-```{r model-comparison}
+```{r comparison, echo=FALSE}
 train_ctrl <- evaluate(model_controlled, train_data)
 train_full <- evaluate(model_full, train_data)
-
+res <- list(Full = list(train_full, test_full), Baseline = list(train_base, test_base),
+            Controlled = list(train_ctrl, test_ctrl))
 comparison <- data.frame(
-  Model       = c("Majority class (always benign)", "Fully grown", "Baseline (default)", "Controlled (depth 2)"),
-  Leaves      = c(1, tree_size(model_full)["leaves"], tree_size(model_baseline)["leaves"], tree_size(model_controlled)["leaves"]),
-  Train_Acc   = c(mean(train_data$class == "benign"), train_full$metrics["Accuracy"],
-                  train_base$metrics["Accuracy"], train_ctrl$metrics["Accuracy"]),
-  Test_Acc    = c(mean(test_data$class == "benign"), test_full$metrics["Accuracy"],
-                  test_base$metrics["Accuracy"], test_ctrl$metrics["Accuracy"]),
-  Sensitivity = c(0, test_full$metrics["Sensitivity"], test_base$metrics["Sensitivity"], test_ctrl$metrics["Sensitivity"]),
-  Specificity = c(1, test_full$metrics["Specificity"], test_base$metrics["Specificity"], test_ctrl$metrics["Specificity"]),
-  Precision   = c(NA, test_full$metrics["Precision"], test_base$metrics["Precision"], test_ctrl$metrics["Precision"]),
-  F1          = c(NA, test_full$metrics["F1"], test_base$metrics["F1"], test_ctrl$metrics["F1"]),
-  Test_FN     = c(sum(test_data$class == "malignant"), test_full$metrics["FN"], test_base$metrics["FN"], test_ctrl$metrics["FN"]),
-  Test_FP     = c(0, test_full$metrics["FP"], test_base$metrics["FP"], test_ctrl$metrics["FP"]),
-  row.names = NULL
-)
-knitr::kable(comparison, digits = 3,
-             caption = "Training accuracy and held-out test metrics (positive class = malignant)")
+  Model = names(res),
+  Leaves = sapply(list(model_full, model_baseline, model_controlled), function(m) tree_size(m)["leaves"]),
+  Train_Accuracy = sapply(res, function(r) r[[1]]$metrics["Accuracy"]),
+  t(sapply(res, function(r) r[[2]]$metrics)),
+  row.names = NULL)
+names(comparison)[4:8] <- paste0("Test_", names(comparison)[4:8])
+knitr::kable(comparison, digits = 3)
 ```
 
-```{r ci-check}
-# 95% exact (Clopper-Pearson) intervals for test accuracy, showing how much uncertainty a test set of this size carries
-ci <- function(m) {
-  correct <- sum(diag(m$cm))
-  round(binom.test(correct, sum(m$cm))$conf.int, 3)
-}
-rbind(Baseline = ci(test_base), Controlled = ci(test_ctrl), Full = ci(test_full))
-```
+**Test accuracy.** The baseline tree has the highest test accuracy at `r round(100*test_base$metrics["Accuracy"],1)`% (a single error), followed by the controlled tree at `r round(100*test_ctrl$metrics["Accuracy"],1)`% and the fully grown tree at `r round(100*test_full$metrics["Accuracy"],1)`%. All three are well above the `r round(100*baseline_acc,1)`% majority baseline. The fully grown tree is the clearest result here. It is perfect on training data and the worst on the test set, missing `r test_full$metrics["FN"]` cancers, which is classic overfitting. The two smaller trees actually score slightly higher on test than on training, which partly reflects a small, easy test set.
 
-### Response
+**Do all the metrics agree?** On this split, yes. However, specificity and precision cannot tell the trees apart, because none of the trees produced a false positive and all three score 100% on both. The trees differ only in missed cancers (`r test_base$metrics["FN"]`, `r test_ctrl$metrics["FN"]` and `r test_full$metrics["FN"]`), and sensitivity, F1 and accuracy all follow that count. On a different split, a tree could easily trade extra false alarms for fewer misses, and then the metrics would disagree. The baseline and controlled trees also differ by just one patient, which is well within the noise of a 111-case test set.
 
-**Which model has the greater test accuracy?**
+**False negatives versus false positives.** These two errors are not equally costly. A false negative means a cancer is called benign: the patient may be sent home, and diagnosis and treatment are delayed while the tumour grows. That harm can be permanent. A false positive means a benign mass is flagged as cancer. It leads to anxiety, cost and extra tests or a biopsy, but further testing usually catches the mistake. For this problem sensitivity should be weighted more heavily than specificity, and in practice I would tune the threshold or use an `rpart` loss matrix to reduce missed cancers even at the cost of some false alarms.
 
-The **baseline (default) tree** has the highest test accuracy at **`r round(100*test_base$metrics["Accuracy"],1)`%** (`r test_base$metrics["FN"]+test_base$metrics["FP"]` error out of `r nrow(test_data)`). The controlled depth-2 tree is next at `r round(100*test_ctrl$metrics["Accuracy"],1)`%, and the fully grown tree is at `r round(100*test_full$metrics["Accuracy"],1)`%. All three are far above the `r round(100*mean(test_data$class=="benign"),1)`% majority-class baseline.
+**Is accuracy enough?** No. Accuracy counts a missed cancer and a false alarm as the same, and it is inflated by the easy benign majority (63% for free). Two models with identical accuracy could have very different sensitivity. The choice should be based on the confusion matrix, sensitivity and precision or specificity, together with model simplicity and the uncertainty that comes with a small test set.
 
-The **complexity comparison** shows overfitting clearly. The fully grown tree has the *highest* training accuracy (`r round(100*train_full$metrics["Accuracy"],1)`%, a perfect fit) but the *lowest* test accuracy. Its training-to-test gap is about `r round(100*(train_full$metrics["Accuracy"]-test_full$metrics["Accuracy"]),1)` points. The baseline and controlled trees score *higher* on the test set than on training data. This is partly luck in a small test set and partly the duplicate overlap noted in 2.3. It shows they are not overfitting. Of the three, the moderately sized trees are the ones most likely to generalize.
+# Part 6: Recommendation
 
-**Do accuracy, sensitivity, specificity, precision, and F1 all favor the same model? Explain.**
+I would select the **baseline tree** (rpart defaults: 3 splits, 4 leaves). On held-out data it caught `r test_base$cm["malignant","malignant"]` of `r sum(test_data$class=="malignant")` cancers with no false alarms. It is simple enough to read as three rules, and each rule points in a clinically sensible direction. The fully grown tree showed that extra complexity made test performance worse. Pruning back to depth 2 cost one additional missed cancer, so the third split seems to earn its place, although the depth-2 tree is a reasonable alternative if simplicity matters most. Cross-validation on the training data (Bonus 2) selected nearly the same tree, and using entropy instead of Gini produced an identical tree (Bonus 1).
 
-**On this test set, yes. But this is partly because none of the trees made a false positive.**
+What the model learned is that malignancy here mainly shows up as cellular irregularity. Uniform cell shape almost always means benign, and among irregular samples, many bare nuclei or enlarged epithelial cells confirm malignancy. This matches how these features are described in cytology, which gives some confidence that the tree is picking up real patterns.
 
-* **Specificity and precision cannot separate the trees.** All three make **zero false positives** on this test set, so every tree has 100% specificity and 100% precision. These two metrics carry no information for choosing between models here.
-* **Sensitivity, F1 and accuracy separate the models**, and here they all depend only on the number of **missed cancers**: `r test_base$metrics["FN"]` for the baseline, `r test_ctrl$metrics["FN"]` for the controlled tree and `r test_full$metrics["FN"]` for the fully grown tree. Sensitivity therefore runs `r round(100*test_base$metrics["Sensitivity"],1)`% > `r round(100*test_ctrl$metrics["Sensitivity"],1)`% > `r round(100*test_full$metrics["Sensitivity"],1)`%, and F1 and accuracy follow the same order.
+**Limitations.**
 
-So every metric that varies favors the baseline tree. On a different split this agreement would not be guaranteed. A more complex tree could, for example, catch more cancers at the cost of more false alarms, and sensitivity and specificity would then point in different directions.
+- The 99% test result is optimistic. The test set has only 41 cancers, `r round(100*n_overlap/nrow(test_data))`% of test rows have an identical profile in training, and across 50 different random splits (Bonus 3) the same procedure averages about 94% accuracy and 93% sensitivity. That is the more realistic expectation.
+- The tree still misses cancers that look uniform on cell shape.
+- Rows with missing bare nuclei were dropped, so the model has no tested way to handle incomplete cases.
+- The tree's structure is unstable. Small changes to the training data can swap cell shape for cell size at the root.
+- The data come from one historical source, scored by people. Other labs may score differently.
 
-**These differences are small.** The baseline and controlled trees differ by a **single patient**. The 95% confidence intervals for test accuracy overlap heavily: baseline `r paste(ci(test_base), collapse=" to ")` versus controlled `r paste(ci(test_ctrl), collapse=" to ")`. The test set cannot reliably separate these two models. The gap to the fully grown tree (5 missed cancers versus 1) is larger, and it matches what the training/test gap already suggests.
+**Before operational use,** I would validate the model on an independent, recent dataset; tune it toward higher sensitivity together with clinicians; use repeated cross-validation instead of a single split; compare it against random forest and logistic regression; and define a clear rule for missing values. Even then, it should only be used to flag cases for review, not to make the diagnosis.
 
-**Are false positives and false negatives equally important in this application? Explain the consequences of each error type.**
+# Bonus 1: Splitting Criterion
 
-**No.** In breast-cancer diagnosis the two errors have very different costs:
-
-* **False negative (malignant case predicted benign):** a cancer is missed. The patient may be reassured and sent home, and diagnosis and treatment are delayed while the tumour can grow and spread. This can reduce the chance of survival and increase how aggressive treatment must be. This is the more serious error, and it is often irreversible.
-* **False positive (benign case predicted malignant):** a healthy patient is flagged. This causes anxiety, extra imaging or a repeat or surgical biopsy, cost, and occasionally unnecessary procedures. These harms are real but usually recoverable: further testing normally corrects the error.
-
-For a tool used in this setting, **sensitivity should be weighted more heavily than specificity**. The decision threshold, or misclassification costs in `rpart` via `parms = list(loss = ...)`, could be adjusted to trade some false positives for fewer false negatives.
-
-**Is accuracy alone sufficient for deciding which model is preferable? Why or why not?**
-
-**No.**
-
-1. Accuracy counts a missed cancer and a false alarm as equally bad, which (as above) they are not.
-2. Because benign cases are the majority, accuracy is inflated by easy benign predictions. The do-nothing classifier already gets `r round(100*mean(test_data$class=="benign"),1)`% while catching no cancers.
-3. Two models with the same accuracy could have very different sensitivity. For example, 3 false negatives and 0 false positives versus 0 false negatives and 3 false positives give the same accuracy but very different clinical value.
-
-Here accuracy happens to agree with sensitivity because no model produced a false positive. The correct way to choose is still to look at the **confusion matrix, sensitivity (for the missed-cancer risk) and precision or specificity (for the false-alarm burden)**, and then add model simplicity and the uncertainty from a small test set.
-
-## 5.4 How Representative Is This One Split?
-
-All results above come from a single 80/20 split (`set.seed(1)`). To check how much they depend on which patients landed in the test set, the whole procedure (stratified split, then a default `rpart` tree, then test evaluation) is repeated with **50 different seeds**. This uses no information from the main test set to choose a model. It only shows how much a single-split estimate can vary. The detailed structural results are discussed in Bonus 3.
-
-```{r resampling-check}
-run_once <- function(seed) {
-  set.seed(seed)
-  idx <- unlist(lapply(split(seq_len(nrow(df)), df$class),
-                       function(rows) sample(rows, round(0.8 * length(rows)))))
-  tr <- df[idx, ]; te <- df[-idx, ]
-  m  <- rpart(class ~ ., data = tr, method = "class")
-  ev <- evaluate(m, te)$metrics
-  f  <- m$frame
-  data.frame(seed = seed,
-             root = as.character(f$var[1]),
-             second_level = paste(sort(unique(as.character(f$var[rownames(f) %in% c("2", "3") & f$var != "<leaf>"]))), collapse = ", "),
-             vars_used = paste(sort(unique(as.character(f$var[f$var != "<leaf>"]))), collapse = ", "),
-             splits = sum(f$var != "<leaf>"),
-             depth  = max(rpart:::tree.depth(as.numeric(rownames(f)))),
-             Accuracy = ev["Accuracy"], Sensitivity = ev["Sensitivity"],
-             Specificity = ev["Specificity"], Precision = ev["Precision"], F1 = ev["F1"],
-             FN = ev["FN"], FP = ev["FP"],
-             row.names = NULL)
-}
-stab <- do.call(rbind, lapply(1:50, run_once))
-
-perf <- stab[, c("Accuracy", "Sensitivity", "Specificity", "Precision", "F1")]
-round(rbind(this_split = test_base$metrics[colnames(perf)],
-            mean_50    = colMeans(perf, na.rm = TRUE),
-            min_50     = apply(perf, 2, min, na.rm = TRUE),
-            max_50     = apply(perf, 2, max, na.rm = TRUE)), 3)
-```
-
-Over 50 splits the default tree averages **`r round(100*mean(stab$Accuracy),1)`% accuracy, `r round(100*mean(stab$Sensitivity),1)`% sensitivity and `r round(100*mean(stab$Specificity),1)`% specificity**. The main split's `r round(100*test_base$metrics["Accuracy"],1)`% accuracy with zero false positives is near the **best case**, not the typical case. This check covers only the default tree, so it does not re-test the model ranking. It does change how much performance to expect on new patients, which should be read from these averages, not from the single split.
-
-# Part 6 - Analytical Recommendation
-
-### Recommendation
-
-**Selected model: the baseline `rpart` tree (default `cp = 0.01`, 3 splits, 4 leaves).**
-
-**Why.** It gives the best balance of **accuracy, sensitivity and simplicity**. On held-out data it caught **`r sum(test_base$cm["malignant","malignant"])` of `r sum(test_data$class=="malignant")` cancers (`r round(100*test_base$metrics["Sensitivity"],1)`% sensitivity)** with **no false alarms** (100% specificity and precision), for `r round(100*test_base$metrics["Accuracy"],1)`% accuracy against a `r round(100*baseline_accuracy,1)`% majority-class baseline. It is small enough to read as three rules, and every rule points in a clinically sensible direction. These exact numbers come from a favorable split. Section 5.4 suggests that roughly 94% accuracy and 93% sensitivity is a more realistic expectation.
-
-**Supporting evidence.**
-
-* **Overfitting experiment.** The fully grown tree had perfect training accuracy but missed `r test_full$metrics["FN"]` cancers on the test set. Extra complexity made predictions *worse*, so the default level of pruning is appropriate.
-* **Simplification experiment.** Removing the third split (the depth-2 tree) cost one additional missed cancer. The baseline's extra rule about epithelial cell size appears to add some value without overfitting. Because that rule affects only about 8% of patients and the difference is one case, the depth-2 tree is a defensible alternative if maximum simplicity matters.
-* **Independent checks on training data only (bonus sections).** 10-fold cross-validation on the fully grown tree selects a **near-identical 4-split tree**: the baseline plus one split on a 6-case leaf, with identical test predictions (Bonus 2). Switching from Gini to information gain produces an **identical tree** (Bonus 1). Over 50 different random splits, the same procedure averages about `r round(100*mean(stab$Accuracy))`% test accuracy and `r round(100*mean(stab$Sensitivity))`% sensitivity. That is still far above the baseline, but clearly below the 99% seen on the main split, and the specific variables in the tree change (Bonus 3).
-
-**What the model learned.** Malignancy here is mainly a matter of **cellular irregularity**. Uniform cell shape (score 1–2) almost always means benign. Among irregular-looking samples, a high bare-nuclei count is the main confirmation of malignancy, and enlarged epithelial cells are a secondary sign. Cell size and shape uniformity are nearly interchangeable. Mitosis adds almost nothing. Clump thickness matters only for rare uniform-looking cancers (see Bonus 2). This is consistent with how cytopathologists describe malignant FNA samples, which gives some confidence that the tree reflects real biology rather than artefacts of this dataset.
-
-**Most important limitations.**
-
-1. **Small, optimistic test set.** With only `r sum(test_data$class=="malignant")` malignant test cases, the 95% interval for sensitivity is wide (about `r paste(round(100*binom.test(sum(test_base$cm["malignant","malignant"]), sum(test_data$class=="malignant"))$conf.int), collapse=" to ")`%). `r round(100*n_overlap/nrow(test_data))`% of test cases have an identical profile in training. The 50-split experiment in Section 5.4 confirms this. The average test accuracy (`r round(100*mean(stab$Accuracy),1)`%), sensitivity (`r round(100*mean(stab$Sensitivity),1)`%) and specificity (`r round(100*mean(stab$Specificity),1)`%) are all noticeably lower than this split's results. False positives *do* occur on other splits. The true error rate on new patients is closer to these averages and to the cross-validated error (about `r round(100*model_baseline$cptable[nrow(model_baseline$cptable),"xerror"]*mean(train_data$class=="malignant"),1)`%) than to the single test error.
-2. **Missed cancers do occur.** The tree missed `r train_base$metrics["FN"]` malignant cases in training, all of them in the "uniform cell shape" leaf. A three-rule model cannot catch cancers that look cytologically bland.
-3. **Missing data and coding.** Rows with missing `bare_nuclei` were dropped, so the model has no tested rule for incomplete cases. The class coding (4 = malignant) was taken from the standard dataset definition and should be confirmed.
-4. **Instability.** As Bonus 3 shows, small changes in the training sample can swap `uniformity_of_cell_shape` for `uniformity_of_cell_size` at the root. The overall performance level is consistent, but the specific rules should not be read as uniquely "true".
-5. **Single, historical source.** The scores are subjective ratings from one setting. Other laboratories may score differently, which would move cases across the tree's hard cut-offs.
-
-**Additional work before operational use.**
-
-* **External validation** on an independent, recent dataset from the intended setting, reporting sensitivity with confidence intervals.
-* **Cost-sensitive tuning.** Lower the malignancy threshold, or use an `rpart` loss matrix that penalises false negatives more, then choose an operating point with clinicians. For example, require sensitivity of at least 98% and accept the resulting false-positive rate.
-* **Repeated cross-validation** to get more stable performance estimates than one 80/20 split, plus a comparison against more stable ensemble methods (random forest, gradient boosting) and logistic regression.
-* **A documented strategy for missing values** (surrogate splits or imputation), validated on cases that actually have missing data.
-* **Use only as decision support:** the model flags cases for review, and a clinician makes the final decision.
-
----
-
-# Bonus Analysis
-
-# Bonus 1 - Splitting Criterion
-
-Two trees are fitted on the same training data with identical controls (the defaults). The only difference is the impurity measure: **Gini** versus **information gain** (entropy).
-
-```{r bonus-splitting-criteria}
-model_gini <- rpart(class ~ ., data = train_data, method = "class",
-                    parms = list(split = "gini"))
+```{r bonus1}
 model_info <- rpart(class ~ ., data = train_data, method = "class",
                     parms = list(split = "information"))
-
 model_info
-
-# Compare structure
-splits_of <- function(m) {
-  f <- m$frame[m$frame$var != "<leaf>", ]
-  paste(f$var, collapse = " | ")
-}
-data.frame(Criterion = c("Gini", "Information"),
-           Root      = c(as.character(model_gini$frame$var[1]), as.character(model_info$frame$var[1])),
-           Splits    = c(splits_of(model_gini), splits_of(model_info)),
-           Leaves    = c(tree_size(model_gini)["leaves"], tree_size(model_info)["leaves"]))
-
-# Do the two trees make identical predictions on the test set?
-all(predict(model_gini, test_data, type = "class") == predict(model_info, test_data, type = "class"))
-
-# Check this is not just an artifact of default pruning: compare fully grown versions too
-full_gini <- rpart(class ~ ., data = train_data, method = "class",
-                   control = rpart.control(cp = 0, minsplit = 2, minbucket = 1))
-full_info <- rpart(class ~ ., data = train_data, method = "class", parms = list(split = "information"),
-                   control = rpart.control(cp = 0, minsplit = 2, minbucket = 1))
-rbind(Gini_full = c(tree_size(full_gini), round(evaluate(full_gini, test_data)$metrics[c("Accuracy", "Sensitivity", "Specificity")], 3)),
-      Info_full = c(tree_size(full_info), round(evaluate(full_info, test_data)$metrics[c("Accuracy", "Sensitivity", "Specificity")], 3)))
+all(predict(model_info, test_data, type = "class") ==
+    predict(model_baseline, test_data, type = "class"))
 ```
 
-```{r bonus1-plot, fig.width=10, fig.height=5}
-rpart.plot(model_info, type = 2, extra = 106, under = TRUE, box.palette = "GnRd",
-           main = "Default tree using information gain (entropy)")
-```
+The information-gain (entropy) tree is identical to the Gini baseline: the same root (`uniformity_of_cell_shape < 2.5`), the same three splits and the same test predictions. Gini and entropy rank candidate splits almost identically and only disagree on close calls, and the top splits in this data are not close. The choice of criterion does not change my recommendation. Controlling complexity matters much more.
 
-### Bonus 1 Response
+# Bonus 2: Cross-Validation for Pruning
 
-* **Same root variable?** Yes. Both criteria split first on `uniformity_of_cell_shape < 2.5`.
-* **Structurally different?** No. At default settings the two trees are **identical**: same variables, same thresholds and same 4 leaves. Fully grown, they differ only in a few low-level splits on tiny nodes.
-* **Different predictions?** The default trees make identical predictions on every test case, so all metrics are the same. The fully grown versions differ only slightly.
-* **Effect on the recommendation?** None. Gini and entropy are both concave impurity measures that rank candidate splits almost the same way. They differ only on close calls, and on this dataset the top splits are not close calls because they separate the classes very cleanly. The recommendation does not depend on the splitting criterion. **Complexity control matters much more than the impurity measure.**
-
-# Bonus 2 - Model Selection with Cross-Validation
-
-`rpart` runs 10-fold cross-validation **within the training data** for every candidate complexity parameter (`cp`). The fully grown tree's CP table is used to choose a pruning level by two rules:
-
-* **Minimum xerror:** the `cp` with the lowest cross-validated error.
-* **1-SE rule:** the *simplest* tree whose cross-validated error is within one standard error of that minimum. This is the usual choice, because it avoids picking an overly complex tree on the basis of a difference that is just noise.
-
-```{r bonus-cross-validation}
-set.seed(2024)   # CV fold assignment is random
+```{r bonus2}
+set.seed(2024)
 cv_tree <- rpart(class ~ ., data = train_data, method = "class",
                  control = rpart.control(cp = 0, minsplit = 2, minbucket = 1, xval = 10))
 cpt <- cv_tree$cptable
 round(cpt, 4)
 
-min_row  <- which.min(cpt[, "xerror"])
-one_se   <- cpt[min_row, "xerror"] + cpt[min_row, "xstd"]
-se_row   <- which(cpt[, "xerror"] <= one_se)[1]
-
-# Use the geometric mean of adjacent cp values so prune() lands in the right interval
-cp_pick <- function(r) if (r == 1) cpt[1, "CP"] else sqrt(cpt[r, "CP"] * cpt[r - 1, "CP"])
-cp_min <- cp_pick(min_row); cp_1se <- cp_pick(se_row)
-
-data.frame(rule = c("Minimum xerror", "1-SE rule"),
-           nsplit = cpt[c(min_row, se_row), "nsplit"],
-           xerror = round(cpt[c(min_row, se_row), "xerror"], 4),
-           cp_used = signif(c(cp_min, cp_1se), 3))
-```
-
-```{r bonus2-plot, fig.width=8, fig.height=4.5}
-plotcp(cv_tree, main = "")
-title("Cross-validated relative error vs. tree complexity (training data only)", line = 3, cex.main = 0.95)
-```
-
-```{r bonus2-evaluate}
+best <- which.min(cpt[, "xerror"])
+se_row <- which(cpt[, "xerror"] <= cpt[best, "xerror"] + cpt[best, "xstd"])[1]
+cp_1se <- sqrt(cpt[se_row, "CP"] * cpt[se_row - 1, "CP"])
 model_cv <- prune(cv_tree, cp = cp_1se)
 model_cv
 
 test_cv <- evaluate(model_cv, test_data)
 test_cv$cm
 round(test_cv$metrics, 3)
-
-# Is it the same tree as the baseline?
-identical(predict(model_cv, test_data, type = "class"),
-          predict(model_baseline, test_data, type = "class"))
-
-# Repeat the CV procedure with different fold assignments to see how stable the choice is
-cv_choice <- sapply(1:20, function(s) {
-  set.seed(s)
-  t <- rpart(class ~ ., data = train_data, method = "class",
-             control = rpart.control(cp = 0, minsplit = 2, minbucket = 1, xval = 10))
-  ct <- t$cptable; r <- which.min(ct[, "xerror"])
-  ct[which(ct[, "xerror"] <= ct[r, "xerror"] + ct[r, "xstd"])[1], "nsplit"]
-})
-table(splits_selected_by_1SE = cv_choice)
 ```
 
-### Bonus 2 Response
-
-* **What did cross-validation select?** The 1-SE rule selects a tree with **`r cpt[se_row,"nsplit"]` splits**. The CP table shows the cross-validated error falling sharply over the first four splits, then flattening. Beyond about 4 splits, the extra reduction in xerror is smaller than one standard error, and the largest trees get worse again. The minimum-xerror rule picks a `r cpt[min_row,"nsplit"]`-split tree, but its xerror is within the noise (one SE) of the much smaller tree.
-* **Different from earlier models?** Only slightly. The CV-selected tree is the **baseline tree plus one extra split**. Inside the "uniform cell shape" branch, it separates the 6 training cases with `clump_thickness ≥ 7`, 5 of which are malignant. The baseline could not make this split because the default `minbucket = 7` forbids a 6-case leaf. On the test set the two trees make **`r ifelse(identical(predict(model_cv, test_data, type="class"), predict(model_baseline, test_data, type="class")), "identical predictions", "different predictions")`**. Clinically the extra rule makes sense (a thick clump with otherwise uniform cells is suspicious), but it rests on only 6 patients. Rerunning CV with 20 different fold assignments chose `r tc <- sort(table(cv_choice), decreasing = TRUE); paste0(names(tc), " splits (", tc, "/20)", collapse = ", ")`. The choice is mostly stable. Cross-validation usually prefers a small tree of 3–4 splits over the 25-split fully grown tree, which supports the earlier conclusion about complexity.
-* **Final test-set performance.** Test accuracy is **`r round(100*test_cv$metrics["Accuracy"],1)`%** with sensitivity `r round(100*test_cv$metrics["Sensitivity"],1)`% and specificity `r round(100*test_cv$metrics["Specificity"],1)`%, the same as the baseline. Because the extra split changes no test prediction and rests on 6 cases, the simpler default tree is kept in Part 6. The CV result confirms that its size is about right, using a training-only selection procedure rather than just accepting the default.
-* **Why selecting parameters on the test set is problematic.** If one tried many `cp`/depth values and kept the one with the best *test* score, the test set would become part of the training process. The winning score would be the maximum of many noisy estimates, which is **biased upward**. With 111 test cases, one case equals 0.9 points of accuracy, so "best on test" mostly reflects chance. There would then be no untouched data left to estimate how the chosen model performs on new patients. Cross-validation on the training data solves this. It chooses complexity from data the test set never touches, so the single test evaluation remains an honest estimate.
-
-# Bonus 3 - Decision-Tree Stability
-
-Section 5.4 repeated the full pipeline (stratified 80/20 split, then a default `rpart` tree) with **50 different random seeds** and recorded, for each run, the root variable, the variables used, the tree size and the test metrics. This section summarizes those results.
-
-```{r bonus-stability}
-# `stab` was computed in Section 5.4 (run_once() over seeds 1-50)
-
-head(stab[, c("seed", "root", "second_level", "splits", "depth", "Accuracy", "Sensitivity", "Specificity")], 10)
-
-# Root variable frequency
-table(Root = stab$root)
-
-# Tree size
-table(Splits = stab$splits)
-
-# How often each predictor appears anywhere in the tree
-vars_long <- unlist(strsplit(stab$vars_used, ", "))
-sort(table(vars_long) / nrow(stab), decreasing = TRUE)
-
-# Variation in test performance
-perf3 <- stab[, c("Accuracy", "Sensitivity", "Specificity")]
-round(rbind(mean = colMeans(perf3), sd = apply(perf3, 2, sd),
-            min = apply(perf3, 2, min), max = apply(perf3, 2, max)), 3)
+```{r bonus2-plot, fig.width=7, fig.height=4}
+plotcp(cv_tree)
 ```
 
-```{r bonus3-plot, fig.width=9, fig.height=4}
-par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
-for (v in c("Accuracy", "Sensitivity", "Specificity")) {
-  hist(stab[[v]], breaks = seq(floor(min(stab[[v]]) * 50) / 50, 1, by = 0.01), col = "#7aa6c2", border = "white",
-       main = v, xlab = "Test value", ylab = "Number of runs")
-  abline(v = mean(stab[[v]]), lwd = 2, lty = 2)
+Using 10-fold cross-validation on the training data only, the minimum cross-validated error occurs at `r cpt[best,"nsplit"]` splits. Under the 1-SE rule, though, the simplest tree within one standard error of that minimum has **`r cpt[se_row,"nsplit"]` splits**. That tree is the baseline plus one extra split, `clump_thickness >= 7` inside the uniform-shape branch, which covers just 6 training cases (5 of them malignant). The default `minbucket = 7` is what kept the baseline from making this split. On the test set the CV tree makes exactly the same predictions as the baseline (`r round(100*test_cv$metrics["Accuracy"],1)`% accuracy), so I kept the simpler baseline. CV mainly confirms that a tree of about 3 to 4 splits is the right size.
+
+Choosing `cp` by test-set score would make the test set part of training. The "best" score would be the maximum of many noisy estimates and therefore biased upward, and with 111 cases one patient is worth almost a full point of accuracy. There would then be no unbiased estimate left. Cross-validation picks the complexity without touching the test set.
+
+# Bonus 3: Stability
+
+```{r bonus3}
+run_once <- function(seed) {
+  set.seed(seed)
+  idx <- unlist(lapply(split(seq_len(nrow(df)), df$class),
+                       function(i) sample(i, round(0.8 * length(i)))))
+  m <- rpart(class ~ ., data = df[idx, ], method = "class")
+  ev <- evaluate(m, df[-idx, ])$metrics
+  data.frame(root = as.character(m$frame$var[1]),
+             splits = sum(m$frame$var != "<leaf>"),
+             uses_bare_nuclei = "bare_nuclei" %in% m$frame$var,
+             Accuracy = ev["Accuracy"], Sensitivity = ev["Sensitivity"],
+             Specificity = ev["Specificity"], row.names = NULL)
 }
+stab <- do.call(rbind, lapply(1:50, run_once))
+
+table(stab$root)
+table(stab$splits)
+mean(stab$uses_bare_nuclei)
+perf <- stab[, c("Accuracy", "Sensitivity", "Specificity")]
+round(rbind(mean = colMeans(perf), sd = apply(perf, 2, sd),
+            min = apply(perf, 2, min), max = apply(perf, 2, max)), 3)
 ```
 
-### Bonus 3 Response
+Across 50 different seeds the root split was not fixed. It was `r paste0(names(sort(table(stab$root), decreasing=TRUE)), " (", sort(table(stab$root), decreasing=TRUE), ")", collapse=", ")`. The swaps are mostly between cell shape and cell size uniformity, which carry nearly the same information, so which one wins depends on a few borderline patients. Trees usually had 3 splits, bare nuclei appeared in `r round(100*mean(stab$uses_bare_nuclei))`% of them, and the lower splits changed from run to run.
 
-* **Does the root split stay the same?** Not always. The root was `r paste(names(sort(table(stab$root), decreasing=TRUE)), " (", sort(table(stab$root), decreasing=TRUE), "/50)", sep="", collapse=", ")`. In 46 of 50 runs the root is one of **cell-shape or cell-size uniformity**, two highly correlated variables that carry nearly the same information. Which one wins depends on a few borderline patients in each training sample.
-* **Do the major branches stay similar?** The *type* of rule is stable, the specific variables are not. The trees are usually small (typically `r paste(names(sort(table(stab$splits), decreasing=TRUE))[1:2], collapse=" to ")` splits). After a uniformity root, a bare-nuclei split usually follows on the irregular branch. `bare_nuclei` appears in `r round(100*mean(grepl("bare_nuclei", stab$vars_used)))`% of the trees. Lower-level splits (epithelial cell size, clump thickness, normal nucleoli, bland chromatin) come and go from run to run.
-* **How much does performance vary?** Test accuracy averages **`r round(100*mean(stab$Accuracy),1)`%** (SD `r round(100*sd(stab$Accuracy),1)` points, range `r round(100*min(stab$Accuracy),1)`–`r round(100*max(stab$Accuracy),1)`%). Sensitivity averages **`r round(100*mean(stab$Sensitivity),1)`%** (range `r round(100*min(stab$Sensitivity),1)`–`r round(100*max(stab$Sensitivity),1)`%). The main split's `r round(100*test_base$metrics["Accuracy"],1)`% accuracy and `r round(100*test_base$metrics["Sensitivity"],1)`% sensitivity are toward the **favorable end** of these ranges. Specificity also varies (mean `r round(100*mean(stab$Specificity),1)`%, minimum `r round(100*min(stab$Specificity),1)`%), so the zero false positives in Part 5 were also partly luck. A more realistic expectation for new data is the average across runs, not the single-split result.
-* **What does this mean for stability?** Decision trees on this dataset show the classic pattern: **performance is consistently good, but the structure is not stable.** Because the predictors are highly correlated, several different trees describe the data almost equally well, and small changes in the sample switch between them. In practice:
-  1. Do not over-interpret the specific variables in any one tree. "Cellular irregularity plus bare nuclei" is the robust finding, not "cell *shape* specifically".
-  2. Report performance across resamples, not from a single split.
-  3. Ensemble methods such as bagging or random forests, which average many trees, are a natural next step to reduce this variance.
-
----
+Performance also varied more than a single split suggests. Accuracy averaged `r round(100*mean(stab$Accuracy),1)`% (range `r round(100*min(stab$Accuracy),1)` to `r round(100*max(stab$Accuracy),1)`%) and sensitivity averaged `r round(100*mean(stab$Sensitivity),1)`% (range `r round(100*min(stab$Sensitivity))` to `r round(100*max(stab$Sensitivity))`%). The main split's 99% sits at the top of this range, and false positives do occur on other splits. Overall, on this dataset, trees perform consistently well but their structure is unstable. I would not over-interpret the specific variables in any single tree, I would report performance over several splits, and bagging or a random forest would be a natural next step to reduce this variance.
 
 # AI Use Disclosure
 
-*Edit this section to describe your own use accurately and to match your course's AI policy.*
-
-* **Tool used:** Claude (Anthropic), an AI assistant.
-* **How it was used:** to help draft the R code (data-quality checks, stratified split, metric helper function, bonus analyses) and to help draft and organize the written interpretation. All code was run, and all results and interpretations were reviewed, checked against the output and edited by me.
-* **Stage of the work:** during analysis and write-up, after the dataset, template and assignment instructions were provided.
+- **Tool:** Claude (Anthropic).
+- **How it was used:** to help write the R code and draft the written interpretation. I ran the code, checked the results against the output, and edited the text.
+- **When:** during the analysis and write-up stage.
