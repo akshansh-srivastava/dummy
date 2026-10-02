@@ -1,15 +1,42 @@
 ---
 title: "ANLY 530 - Assignment 1: Decision Tree Analysis"
-author: "Student Name"
 date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output:
   html_document:
-    theme: flatly
+    theme: null
+    highlight: null
+    mathjax: null
     df_print: kable
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+```{css, echo=FALSE}
+/* Single readable column; tokens for light and dark */
+:root { --bg:#fbfbf9; --fg:#1f2328; --muted:#5b6370; --rule:#d9dcd6; --code-bg:#f1f2ee; --accent:#2f5d8a;
+        --sans: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#16181b; --fg:#e4e6e8; --muted:#9aa1ab; --rule:#33373d; --code-bg:#202328; --accent:#8ab4e0; color-scheme: dark; } }
+:root[data-theme="dark"] { --bg:#16181b; --fg:#e4e6e8; --muted:#9aa1ab; --rule:#33373d; --code-bg:#202328; --accent:#8ab4e0; color-scheme: dark; }
+body { background: var(--bg); color: var(--fg); font: 16px/1.6 var(--sans); max-width: 860px; margin: 0 auto; padding-inline: 20px; padding-block: 32px 64px; box-sizing: border-box; }
+div.sourceCode, pre.sourceCode { background: transparent !important; }
+h1.title { font-size: 1.8rem; line-height: 1.25; margin: 0 0 .25rem; text-wrap: balance; }
+h4.date { color: var(--muted); font-weight: 400; font-size: .95rem; margin: 0 0 2rem; }
+h1 { font-size: 1.45rem; margin: 2.6rem 0 .8rem; padding-top: 1rem; border-top: 1px solid var(--rule); text-wrap: balance; }
+h2 { font-size: 1.15rem; margin: 1.8rem 0 .6rem; color: var(--accent); }
+p, li { max-width: 68ch; }
+pre, code { font-family: var(--mono); font-size: .86rem; }
+pre { background: var(--code-bg); color: var(--fg); border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px; overflow-x: auto; }
+pre code { background: none; }
+:not(pre) > code { background: var(--code-bg); padding: 1px 4px; border-radius: 3px; }
+pre:not(.r) { background: transparent; border-style: dashed; }
+table { border-collapse: collapse; margin: 1rem 0; font-variant-numeric: tabular-nums; display: block; overflow-x: auto; max-width: 100%; }
+th, td { border-bottom: 1px solid var(--rule); padding: 4px 10px; text-align: right; }
+th:first-child, td:first-child { text-align: left; }
+img { max-width: 100%; height: auto; background: #fff; border-radius: 4px; }
+code span { color: inherit; }
 ```
 
 ```{r load}
@@ -198,6 +225,16 @@ rpart.plot(model_full, type = 2, extra = 106, cex = 0.6, box.palette = "GnRd",
 ```
 
 **How the structure changed.** The controlled tree keeps the same two top splits as the baseline (cell shape, then bare nuclei) and drops only the epithelial cell size split. The mixed group of `r nn["6"]` cases becomes a single benign leaf. The fully grown tree goes to `r tree_size(model_full)["leaves"]` leaves and depth `r tree_size(model_full)["depth"]`, and many of its leaves hold only 1 to 3 patients. Those lower splits isolate individual unusual cases rather than general patterns. All three trees share the same root, so the main signal is stable. They differ only in how far they chase the small, ambiguous groups.
+
+**Training vs. test performance.**
+
+```{r complexity-perf}
+acc <- function(m, d) mean(predict(m, d, type = "class") == d$class)
+models <- list(Full = model_full, Baseline = model_baseline, Controlled = model_controlled)
+round(sapply(models, function(m) c(train = acc(m, train_data), test = acc(m, test_data))), 3)
+```
+
+Making the tree more complex raised training accuracy but lowered test accuracy. The fully grown tree fits the training data perfectly (100%) but drops to `r round(100*acc(model_full, test_data),1)`% on the test set. The baseline and controlled trees have lower training accuracy (`r round(100*acc(model_baseline, train_data),1)`% and `r round(100*acc(model_controlled, train_data),1)`%) but higher test accuracy (`r round(100*acc(model_baseline, test_data),1)`% and `r round(100*acc(model_controlled, test_data),1)`%). The baseline and controlled trees are the ones likely to generalize. Neither shows a gap between training and test performance, their leaves are large, and their splits follow the strongest variables. The fully grown tree's large drop from training to test is direct evidence that it memorized noise.
 
 # Part 5: Model Evaluation (Test Set)
 
